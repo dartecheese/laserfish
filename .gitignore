@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+data/
+models/
+state/
+logs/
+*.onnx
+*.onnx.data
+*.pkl
+*.pt
+*.sqlite
+.DS_Store

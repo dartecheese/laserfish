@@ -1,0 +1,35 @@
+[project]
+name = "laserfish"
+version = "0.1.0"
+description = "5-minute perp scalper on Hyperliquid — momentum + Transformer classifier, information-driven bars, triple-barrier labeling"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "torch>=2.3",
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+    "onnxscript>=0.1",
+    "scikit-learn>=1.5",
+    "requests>=2.32",
+    "ccxt>=4.4",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+    "websockets>=12.0",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["trader*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
