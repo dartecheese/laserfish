@@ -33,7 +33,7 @@ def main():
     ap.add_argument("--train-months", type=int, default=18)
     ap.add_argument("--test-months", type=int, default=3)
     ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch-size", type=int, default=512)  # larger batch for 5m density
+    ap.add_argument("--batch-size", type=int, default=2048)  # large batch for MPS/M5
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--out", default="models/transformer_5m.onnx")
     args = ap.parse_args()

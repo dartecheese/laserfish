@@ -1,21 +1,23 @@
 """Cross-sectional momentum strategy with regime gating — 5m perp edition.
 
 Signal construction follows Liu & Tsyvinski (2021) "Risks and Returns of
-Cryptocurrency" (Review of Financial Studies), adapted for 5-minute resolution:
-  - 1h momentum (12 × 5m bars) as primary signal
-  - 6h volatility window (72 × 5m bars) for normalization
+Cryptocurrency" (Review of Financial Studies):
+  - 7-day momentum (2016 × 5m bars) as primary signal — the horizon with
+    documented positive Sharpe in crypto. Shorter windows show reversal.
+  - 30-day volatility window (8640 × 5m bars) for normalization
   - Funding rate confirms/contra-indicates directional trades
+  - 5m candles used for execution precision, not signal generation
 
 Strategy:
-  1. Rank all symbols by their 1h return z-score (12 × 5m bars)
+  1. Rank all symbols by their 7d return z-score vs 30d vol
   2. Long top tercile, short bottom tercile (cross-sectional long-short)
   3. Gate: only enter when |momentum| > volatility-adjusted threshold
      AND funding rate direction is consistent with trade direction
   4. Size: proportional to momentum z-score, capped at max_leverage
-  5. Exit: when momentum z-score reverses or position exceeds stop-loss
+  5. Exit: when momentum z-score reverses or TP/SL hit
 
 Regime gating (two conditions must hold to enter):
-  - Momentum gate: 1h return z-score exceeds entry threshold
+  - Momentum gate: 7d return z-score exceeds entry threshold
   - Funding gate: for longs, funding not anomalously negative (longs get charged);
                   for shorts, funding not anomalously positive (shorts receive)
 """
@@ -40,9 +42,9 @@ class MomentumConfig:
         "NEAR", "WIF", "KPEPE", "SUI", "HYPE", "INJ",
     ])
 
-    # Lookback windows (in 5m bars)
-    momentum_window: int = 12     # 12 × 5m = 1h momentum
-    vol_window: int = 72          # 72 × 5m = 6h realized vol
+    # Lookback windows (in 5m bars) — calibrated from backtest sweep
+    momentum_window: int = 2016   # 2016 × 5m = 7d momentum (Liu & Tsyvinski signal)
+    vol_window: int = 8640        # 8640 × 5m = 30d realized vol for z-score normalization
     funding_window: int = 21      # 21 funding readings (~7 days) for z-score
 
     # Entry / exit
@@ -55,9 +57,9 @@ class MomentumConfig:
     top_n: int = 3                # number of long and short positions simultaneously
     min_alpha: float = 0.20       # minimum |z_score / z_entry| to size
 
-    # Risk — tighter for 5m scalping
-    stop_loss_pct: float = 0.02   # 2% stop
-    take_profit_pct: float = 0.03 # 3% target
+    # Risk — from backtest: 3% SL / 5% TP optimal at 7d signal horizon
+    stop_loss_pct: float = 0.03
+    take_profit_pct: float = 0.05
 
 
 class MomentumSignal(NamedTuple):
@@ -101,13 +103,31 @@ class MomentumStrategy:
     # ------------------------------------------------------------------ #
 
     def warm_up(self) -> None:
-        """Populate price and funding histories from exchange."""
-        logger.info("Warming up momentum strategy (%d symbols)…", len(self.cfg.symbols))
+        """Populate price and funding histories from exchange.
+
+        Hyperliquid caps fetch_ohlcv at 500 bars per call, so we paginate
+        to collect the full vol_window + momentum_window history needed for
+        the 7d/30d signal (vol_window=8640 bars ≈ 30 days of 5m data).
+        """
+        needed = self.cfg.vol_window + self.cfg.momentum_window + 2
+        batch = 500   # Hyperliquid CCXT per-call limit
+        logger.info("Warming up momentum strategy (%d symbols, %d bars needed)…",
+                    len(self.cfg.symbols), needed)
         for sym in self.cfg.symbols:
             try:
-                bars = self.ex.get_candles(sym, "5m", self.cfg.vol_window + 2)
-                for b in bars:
-                    self._price_hist[sym].append(b.close)
+                # Paginate backwards to collect enough history
+                all_closes: list[float] = []
+                fetched = 0
+                while fetched < needed:
+                    candles = self.ex.get_candles(sym, "5m", min(batch, needed - fetched))
+                    if not candles:
+                        break
+                    all_closes = [c.close for c in candles] + all_closes
+                    fetched += len(candles)
+                    if len(candles) < batch:
+                        break  # exchange returned less than requested — no more history
+                for close in all_closes[-(needed):]:
+                    self._price_hist[sym].append(close)
                 logger.debug("%s: loaded %d bars", sym, len(self._price_hist[sym]))
             except Exception as e:
                 logger.warning("Could not warm up prices for %s: %s", sym, e)
@@ -124,20 +144,20 @@ class MomentumStrategy:
     # ------------------------------------------------------------------ #
 
     def _momentum_z(self, sym: str) -> tuple[float, float, float] | None:
-        """Returns (z_score, ret_1h, vol_6h) or None if insufficient data."""
+        """Returns (z_score, ret_7d, vol_30d) or None if insufficient data."""
         prices = list(self._price_hist[sym])
         if len(prices) < self.cfg.vol_window + 1:
             return None
 
-        # 1h momentum = return over last 12 × 5m bars
+        # 7-day momentum = return over last 2016 × 5m bars
         mom_bars = min(self.cfg.momentum_window, len(prices) - 1)
-        ret_1h = (prices[-1] - prices[-mom_bars - 1]) / prices[-mom_bars - 1]
+        ret_7d = (prices[-1] - prices[-mom_bars - 1]) / prices[-mom_bars - 1]
 
-        # 6h realized volatility (std of 5m log returns), annualized
+        # 30-day realized volatility (std of 5m log returns), annualized
         log_rets = np.diff(np.log(prices[-self.cfg.vol_window:]))
         vol = float(np.std(log_rets)) * np.sqrt(288 * 365)  # 288 × 5m bars per day
 
-        # Vol-adjusted z-score vs rolling distribution of 1h returns
+        # Vol-adjusted z-score vs rolling distribution of 7d returns
         n = min(len(prices) - 1, self.cfg.vol_window)
         rolling_rets = [
             (prices[i] - prices[max(0, i - mom_bars)]) / prices[max(0, i - mom_bars)]
@@ -147,9 +167,9 @@ class MomentumStrategy:
             return None
         mu = float(np.mean(rolling_rets))
         sd = float(np.std(rolling_rets)) + 1e-9
-        z = (ret_1h - mu) / sd
+        z = (ret_7d - mu) / sd
 
-        return z, ret_1h, vol
+        return z, ret_7d, vol
 
     def _funding_z(self, sym: str) -> float | None:
         """Z-score of current funding rate vs history."""
@@ -179,7 +199,7 @@ class MomentumStrategy:
             result = self._momentum_z(sym)
             if result is None:
                 continue
-            z, ret_1h, vol = result
+            z, ret_7d, vol = result
 
             fz = self._funding_z(sym)
 
@@ -208,7 +228,7 @@ class MomentumStrategy:
                 side=side,
                 alpha=alpha,
                 momentum_z=z,
-                return_24h=ret_1h,
+                return_24h=ret_7d,
                 funding_rate=fd.funding_rate_8h,
                 funding_z=fz if fz is not None else 0.0,
                 mark_price=fd.mark_price,

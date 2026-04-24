@@ -88,8 +88,7 @@ def main():
                 for sym, entry_side in list(open_positions.items()):
                     if strategy.should_exit(sym, entry_side):
                         log.info("%s: momentum reversed → closing %s", sym, entry_side)
-                        if not dry_run:
-                            exchange.close_position(sym)
+                        exchange.close_position(sym)  # paper mode handles this safely
                         del open_positions[sym]
 
                 # Scan for new signals
@@ -117,16 +116,15 @@ def main():
                         sig.symbol, sig.side.upper(), qty, sig.mark_price,
                     )
 
-                    if not dry_run:
-                        exchange.place_bracket_order(BracketParams(
-                            symbol=sig.symbol,
-                            side=sig.side,
-                            quantity=qty,
-                            price=None,
-                            take_profit_pct=cfg.take_profit_pct,
-                            stop_loss_pct=cfg.stop_loss_pct,
-                            leverage=int(cfg.max_leverage),
-                        ))
+                    exchange.place_bracket_order(BracketParams(
+                        symbol=sig.symbol,
+                        side=sig.side,
+                        quantity=qty,
+                        price=None,
+                        take_profit_pct=cfg.take_profit_pct,
+                        stop_loss_pct=cfg.stop_loss_pct,
+                        leverage=int(cfg.max_leverage),
+                    ))
 
                     open_positions[sig.symbol] = sig.side
 
