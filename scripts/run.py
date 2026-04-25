@@ -81,8 +81,8 @@ def main():
     ap.add_argument("--top-n", type=int, default=3)
     ap.add_argument("--leverage", type=float, default=2.0)
     ap.add_argument("--max-position-pct", type=float, default=0.20)
-    ap.add_argument("--z-entry", type=float, default=1.2)
-    ap.add_argument("--poll-seconds", type=int, default=300)
+    ap.add_argument("--z-entry", type=float, default=1.8)
+    ap.add_argument("--poll-seconds", type=int, default=172800)  # 48h — tuned R7
     ap.add_argument("--live", action="store_true",
                     help="Place real orders. Default is paper/dry-run.")
     args = ap.parse_args()

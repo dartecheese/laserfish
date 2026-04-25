@@ -47,8 +47,8 @@ class MomentumConfig:
     vol_window: int = 8640        # 8640 × 5m = 30d realized vol for z-score normalization
     funding_window: int = 21      # 21 funding readings (~7 days) for z-score
 
-    # Entry / exit
-    z_entry: float = 1.2          # momentum z-score to enter
+    # Entry / exit — z_entry=1.8 tuned via 12×30d walk-forward sweep (R1)
+    z_entry: float = 1.8          # momentum z-score to enter
     z_exit: float = 0.3           # momentum z-score to exit
     funding_z_veto: float = 1.5   # veto longs when funding z-score < -1.5 (longs charged)
 
