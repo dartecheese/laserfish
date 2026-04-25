@@ -39,6 +39,7 @@ from trader.model import load_onnx, infer_alpha
 from trader.regime import RegimeDetector, REGIME_LABEL, REGIME_COLORS
 from trader.leverage import DynamicLeverage, LeverageConfig
 from trader.strategies.mean_reversion import MeanReversionConfig, MeanReversionStrategy, MRSignal
+from trader.strategies.grid import GridConfig, GridStrategy
 
 # Minimum Transformer alpha to confirm a momentum entry.
 TRANSFORMER_MIN_CONFIRM = 0.10
@@ -210,6 +211,17 @@ def main():
     mr_cfg = MeanReversionConfig(symbols=symbols)
     mr_strategy = MeanReversionStrategy(exchange, mr_cfg)
 
+    # Grid strategy — anchored on BTC, active only in RANGE regime
+    grid = GridStrategy(exchange, GridConfig(
+        symbol="BTC",
+        spacing_pct=0.005,    # 0.5% between levels
+        n_levels=10,          # 10 buy + 10 sell = 20 orders
+        order_size_pct=0.04,  # 4% equity per level
+        max_leverage=2.0,
+    ))
+    _last_grid_check = 0.0
+    GRID_CHECK_INTERVAL = 60   # seconds between grid fill checks
+
     log.info("Laserfish v2 starting | symbols=%d | transformer=%s | dynamic_leverage=True | dry_run=%s",
              len(symbols), session is not None, dry_run)
 
@@ -254,6 +266,7 @@ def main():
 
     open_positions: dict[str, str] = {}       # symbol → side (momentum positions)
     mr_positions: dict[str, tuple[str, str]] = {}  # symbol → (side, signal_type)
+    _last_grid_check = 0.0
 
     while True:
         try:
@@ -404,10 +417,40 @@ def main():
                 except Exception as e:
                     log.error("MR scan error: %s", e)
 
+            # ── Grid strategy — runs every 60s, active only in RANGE regime ──
+            now = time.time()
+            if now - _last_grid_check >= GRID_CHECK_INTERVAL:
+                _last_grid_check = now
+                try:
+                    btc_fd = exchange.get_funding_data("BTC")
+                    btc_price = btc_fd.mark_price
+
+                    if regime_state == 1:   # RANGE — activate or maintain grid
+                        if not grid.is_active:
+                            log.info("Regime=RANGE — opening BTC grid at %.2f", btc_price)
+                            grid.open(btc_price, equity)
+                        else:
+                            fills = grid.check(btc_price, equity)
+                            for f in fills:
+                                log.info("Grid fill | %s lvl=%+d  qty=%.4f  pnl=%+.2f",
+                                         "BUY " if f.side == "buy" else "SELL",
+                                         f.level_idx, f.qty, f.pnl)
+                            if fills:
+                                log.info(grid.status(btc_price))
+
+                    else:                   # TREND or CRISIS — close grid if active
+                        if grid.is_active:
+                            pnl = grid.close(btc_price)
+                            log.info("Regime=%s — grid closed | total pnl=%+.2f",
+                                     regime_name, pnl)
+
+                except Exception as e:
+                    log.error("Grid error: %s", e)
+
         except Exception as e:
             log.error("Scan loop error: %s", e)
 
-        time.sleep(args.poll_seconds)
+        time.sleep(min(args.poll_seconds, GRID_CHECK_INTERVAL))
 
 
 if __name__ == "__main__":
