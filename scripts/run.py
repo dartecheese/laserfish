@@ -38,6 +38,7 @@ from trader.features import live_sequence
 from trader.model import load_onnx, infer_alpha
 from trader.regime import RegimeDetector, REGIME_LABEL, REGIME_COLORS
 from trader.leverage import DynamicLeverage, LeverageConfig
+from trader.strategies.mean_reversion import MeanReversionConfig, MeanReversionStrategy, MRSignal
 
 # Minimum Transformer alpha to confirm a momentum entry.
 TRANSFORMER_MIN_CONFIRM = 0.10
@@ -205,18 +206,26 @@ def main():
     # HMM regime tracker (anchored on BTC)
     regime_tracker = RegimeTracker(exchange, anchor="BTC")
 
+    # Mean-reversion + carry strategy (fires when momentum is absent)
+    mr_cfg = MeanReversionConfig(symbols=symbols)
+    mr_strategy = MeanReversionStrategy(exchange, mr_cfg)
+
     log.info("Laserfish v2 starting | symbols=%d | transformer=%s | dynamic_leverage=True | dry_run=%s",
              len(symbols), session is not None, dry_run)
 
     log.info("Warming up momentum strategy…")
     strategy.warm_up()
 
+    log.info("Warming up mean-reversion strategy…")
+    mr_strategy.warm_up()
+
     log.info("Warming up HMM regime detector…")
     regime_tracker.warm_up()
 
     log.info("Warm-up complete. Entering scan loop (poll=%ds).", args.poll_seconds)
 
-    open_positions: dict[str, str] = {}
+    open_positions: dict[str, str] = {}       # symbol → side (momentum positions)
+    mr_positions: dict[str, tuple[str, str]] = {}  # symbol → (side, signal_type)
 
     while True:
         try:
@@ -305,6 +314,67 @@ def main():
                         ))
 
                         open_positions[sig.symbol] = sig.side
+
+            # ── Mean-reversion + carry scan ───────────────────────────
+            # MR fires in ranging/bear regimes; momentum fires in trending
+            # Both can fire simultaneously on different symbols
+            mr_poll_due = not hasattr(main, '_last_mr_poll') or \
+                          (time.time() - getattr(main, '_last_mr_poll', 0)) >= 3600  # 1h cadence
+            if mr_poll_due:
+                main._last_mr_poll = time.time()
+                try:
+                    # Exit existing MR positions if signal reverted
+                    for sym, (entry_side, sig_type) in list(mr_positions.items()):
+                        if mr_strategy.should_exit(sym, entry_side, sig_type):
+                            log.info("%s: MR/carry exit — %s signal normalized", sym, sig_type)
+                            exchange.close_position(sym)
+                            del mr_positions[sym]
+
+                    mr_signals = mr_strategy.scan()
+                    for sig in mr_signals:
+                        log.info(MeanReversionStrategy.format_signal(sig))
+
+                        all_open = set(open_positions) | set(mr_positions) | set(pos_map)
+                        if sig.symbol in all_open:
+                            continue
+
+                        # Use lower leverage for MR (it's counter-trend)
+                        mr_lev = lev_engine.compute(
+                            realized_vol_24h=max(sig.mark_price * 0.0001, 0.40),
+                            regime_multiplier=min(regime_mult, 1.0),  # cap at 1x for MR
+                            drawdown_pct=drawdown,
+                            funding_z=abs(sig.funding_z),
+                        )
+                        mr_lev = min(mr_lev, 2.0)  # hard cap MR at 2x
+
+                        qty = lev_engine.size_position(
+                            equity=equity,
+                            mark_price=sig.mark_price,
+                            leverage=mr_lev,
+                            alpha=sig.alpha,
+                            max_position_pct=0.10,  # smaller allocation for MR
+                        )
+                        if qty <= 0:
+                            continue
+
+                        log.info("%s: MR/CARRY OPEN %s  qty=%.4f  mark=%.4f  lev=%.2fx  type=%s",
+                                 sig.symbol, sig.side.upper(), qty, sig.mark_price,
+                                 mr_lev, sig.signal_type)
+
+                        # MR uses tighter TP/SL than momentum
+                        exchange.place_bracket_order(BracketParams(
+                            symbol=sig.symbol,
+                            side=sig.side,
+                            quantity=qty,
+                            price=None,
+                            take_profit_pct=mr_cfg.take_profit_pct,
+                            stop_loss_pct=mr_cfg.stop_loss_pct,
+                            leverage=int(round(mr_lev)),
+                        ))
+                        mr_positions[sig.symbol] = (sig.side, sig.signal_type)
+
+                except Exception as e:
+                    log.error("MR scan error: %s", e)
 
         except Exception as e:
             log.error("Scan loop error: %s", e)
