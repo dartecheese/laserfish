@@ -284,6 +284,26 @@ class HyperliquidExchange(Exchange):
         history = self._client.fetch_funding_rate_history(hl_sym, limit=limit)
         return [(int(r["timestamp"]), float(r["fundingRate"])) for r in history]
 
+    def get_open_interest(self, symbol: str) -> float:
+        """Return current open interest in base-asset contracts."""
+        try:
+            hl_sym = _hl_symbol(symbol)
+            data = self._client.fetch_open_interest(hl_sym)
+            return float(data.get("openInterestAmount") or data.get("openInterest") or 0.0)
+        except Exception:
+            return 0.0
+
+    def get_predicted_funding(self, symbol: str) -> float:
+        """Return Hyperliquid's predicted 1h funding rate (fraction)."""
+        try:
+            hl_sym = _hl_symbol(symbol)
+            fr = self._client.fetch_funding_rate(hl_sym)
+            # ccxt exposes 'nextFundingRate' for predicted funding when available
+            predicted = fr.get("nextFundingRate") or fr.get("fundingRate") or 0.0
+            return float(predicted)
+        except Exception:
+            return 0.0
+
     def get_l2_book(self, symbol: str, limit: int = 20) -> dict:
         """Return ccxt-style order book: {"bids": [[px, sz], ...], "asks": [...]}."""
         return self._client.fetch_order_book(_hl_symbol(symbol), limit=limit)
