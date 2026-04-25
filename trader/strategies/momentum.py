@@ -102,42 +102,57 @@ class MomentumStrategy:
     # Warm-up                                                              #
     # ------------------------------------------------------------------ #
 
-    def warm_up(self) -> None:
+    def warm_up(self, shared_prices: dict | None = None, shared_funding: dict | None = None) -> None:
         """Populate price and funding histories from exchange.
+
+        Accepts pre-fetched shared_prices/shared_funding dicts to avoid duplicate
+        API calls when multiple strategies warm up on the same symbols.
 
         Hyperliquid caps fetch_ohlcv at 500 bars per call, so we paginate
         to collect the full vol_window + momentum_window history needed for
         the 7d/30d signal (vol_window=8640 bars ≈ 30 days of 5m data).
         """
+        import time as _time
         needed = self.cfg.vol_window + self.cfg.momentum_window + 2
         batch = 500   # Hyperliquid CCXT per-call limit
         logger.info("Warming up momentum strategy (%d symbols, %d bars needed)…",
                     len(self.cfg.symbols), needed)
         for sym in self.cfg.symbols:
-            try:
-                # Paginate backwards to collect enough history
-                all_closes: list[float] = []
-                fetched = 0
-                while fetched < needed:
-                    candles = self.ex.get_candles(sym, "5m", min(batch, needed - fetched))
-                    if not candles:
-                        break
-                    all_closes = [c.close for c in candles] + all_closes
-                    fetched += len(candles)
-                    if len(candles) < batch:
-                        break  # exchange returned less than requested — no more history
-                for close in all_closes[-(needed):]:
+            # Use shared data if available
+            if shared_prices and sym in shared_prices:
+                for close in shared_prices[sym]:
                     self._price_hist[sym].append(close)
-                logger.debug("%s: loaded %d bars", sym, len(self._price_hist[sym]))
-            except Exception as e:
-                logger.warning("Could not warm up prices for %s: %s", sym, e)
+                logger.debug("%s: loaded %d bars (shared)", sym, len(self._price_hist[sym]))
+            else:
+                try:
+                    all_closes: list[float] = []
+                    fetched = 0
+                    while fetched < needed:
+                        candles = self.ex.get_candles(sym, "5m", min(batch, needed - fetched))
+                        if not candles:
+                            break
+                        all_closes = [c.close for c in candles] + all_closes
+                        fetched += len(candles)
+                        if len(candles) < batch:
+                            break
+                    for close in all_closes[-(needed):]:
+                        self._price_hist[sym].append(close)
+                    logger.debug("%s: loaded %d bars", sym, len(self._price_hist[sym]))
+                    _time.sleep(0.3)  # avoid 429s on burst
+                except Exception as e:
+                    logger.warning("Could not warm up prices for %s: %s", sym, e)
 
-            try:
-                hist = self.ex.get_funding_rate_history(sym, limit=self.cfg.funding_window)
-                for _, rate in hist:
+            if shared_funding and sym in shared_funding:
+                for rate in shared_funding[sym]:
                     self._funding_hist[sym].append(rate)
-            except Exception as e:
-                logger.warning("Could not warm up funding for %s: %s", sym, e)
+            else:
+                try:
+                    hist = self.ex.get_funding_rate_history(sym, limit=self.cfg.funding_window)
+                    for _, rate in hist:
+                        self._funding_hist[sym].append(rate)
+                    _time.sleep(0.2)
+                except Exception as e:
+                    logger.warning("Could not warm up funding for %s: %s", sym, e)
 
     # ------------------------------------------------------------------ #
     # Signal generation                                                    #

@@ -89,33 +89,15 @@ class MeanReversionStrategy:
             for s in self.cfg.symbols
         }
 
-    def warm_up(self) -> None:
-        """Reuse price/funding history from exchange (same calls as momentum warm_up)."""
-        needed = self.cfg.vol_window + self.cfg.momentum_window + 2
-        batch = 500
+    def warm_up(self, shared_prices: dict | None = None, shared_funding: dict | None = None) -> None:
+        """Populate history. Accepts shared data to avoid duplicate API calls."""
         for sym in self.cfg.symbols:
-            try:
-                all_closes: list[float] = []
-                fetched = 0
-                while fetched < needed:
-                    candles = self.ex.get_candles(sym, "5m", min(batch, needed - fetched))
-                    if not candles:
-                        break
-                    all_closes = [c.close for c in candles] + all_closes
-                    fetched += len(candles)
-                    if len(candles) < batch:
-                        break
-                for close in all_closes[-(needed):]:
+            if shared_prices and sym in shared_prices:
+                for close in shared_prices[sym]:
                     self._price_hist[sym].append(close)
-            except Exception as e:
-                logger.debug("MR warm_up prices %s: %s", sym, e)
-
-            try:
-                hist = self.ex.get_funding_rate_history(sym, limit=self.cfg.funding_window)
-                for _, rate in hist:
+            if shared_funding and sym in shared_funding:
+                for rate in shared_funding[sym]:
                     self._funding_hist[sym].append(rate)
-            except Exception as e:
-                logger.debug("MR warm_up funding %s: %s", sym, e)
 
     def _momentum_z(self, sym: str) -> float | None:
         prices = list(self._price_hist[sym])

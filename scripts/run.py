@@ -213,11 +213,39 @@ def main():
     log.info("Laserfish v2 starting | symbols=%d | transformer=%s | dynamic_leverage=True | dry_run=%s",
              len(symbols), session is not None, dry_run)
 
-    log.info("Warming up momentum strategy…")
-    strategy.warm_up()
+    log.info("Warming up price + funding histories (shared across strategies)…")
+    # Fetch once and share — avoids duplicate API calls and 429 rate limits
+    needed = cfg.vol_window + cfg.momentum_window + 2
+    batch = 500
+    shared_prices: dict[str, list[float]] = {}
+    shared_funding: dict[str, list[float]] = {}
+    import time as _time
+    for sym in symbols:
+        try:
+            all_closes: list[float] = []
+            fetched = 0
+            while fetched < needed:
+                candles = exchange.get_candles(sym, "5m", min(batch, needed - fetched))
+                if not candles:
+                    break
+                all_closes = [c.close for c in candles] + all_closes
+                fetched += len(candles)
+                if len(candles) < batch:
+                    break
+            shared_prices[sym] = all_closes[-(needed):]
+            _time.sleep(0.3)
+        except Exception as e:
+            log.warning("Warm-up prices %s: %s", sym, e)
+        try:
+            hist = exchange.get_funding_rate_history(sym, limit=cfg.funding_window)
+            shared_funding[sym] = [r for _, r in hist]
+            _time.sleep(0.2)
+        except Exception as e:
+            log.warning("Warm-up funding %s: %s", sym, e)
+    log.info("Shared warm-up complete (%d symbols).", len(shared_prices))
 
-    log.info("Warming up mean-reversion strategy…")
-    mr_strategy.warm_up()
+    strategy.warm_up(shared_prices=shared_prices, shared_funding=shared_funding)
+    mr_strategy.warm_up(shared_prices=shared_prices, shared_funding=shared_funding)
 
     log.info("Warming up HMM regime detector…")
     regime_tracker.warm_up()
