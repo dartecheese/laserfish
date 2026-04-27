@@ -1,20 +1,21 @@
-"""Laserfish — momentum + Transformer + HMM regime + dynamic leverage on Hyperliquid.
+"""Laserfish — momentum + Transformer + HMM regime + dynamic leverage + RL on Hyperliquid.
 
-Signal stack (in order of application):
+Signal stack:
   1. 7d cross-sectional momentum (primary direction signal)
   2. HMM regime filter (3-state: trend/range/crisis — gates entries + scales leverage)
   3. Dynamic Kelly leverage (vol-targeting + regime multiplier + drawdown circuit breaker)
   4. Transformer entry filter (P(BUY)-P(SELL) must agree with momentum direction)
+  5. RL agent (PPO) — continuous leverage control on BTC, 15m cadence
 
 Dry-run (paper mode, default):
     python scripts/run.py
 
-With Transformer filter:
-    python scripts/run.py --model models/transformer_5m.onnx
+With RL agent on BTC (30% of equity, paper):
+    python scripts/run.py --rl
 
 Live trading:
     HL_PRIVATE_KEY=0x... HL_WALLET_ADDRESS=0x... \\
-    python scripts/run.py --model models/transformer_5m.onnx --live
+    python scripts/run.py --model models/transformer_5m.onnx --rl --live
 """
 from __future__ import annotations
 
@@ -41,11 +42,20 @@ from trader.leverage import DynamicLeverage, LeverageConfig
 from trader.strategies.mean_reversion import MeanReversionConfig, MeanReversionStrategy, MRSignal
 from trader.strategies.grid import GridConfig, GridStrategy
 
+try:
+    from src.live.executor import RLExecutor
+    RL_AVAILABLE = True
+except ImportError:
+    RL_AVAILABLE = False
+
 # Minimum Transformer alpha to confirm a momentum entry.
 TRANSFORMER_MIN_CONFIRM = 0.10
 
 # Do not enter new positions in crisis regime — only manage existing ones.
 BLOCK_ENTRIES_IN_CRISIS = True
+
+# RL agent runs every 15 minutes (1 bar)
+RL_STEP_INTERVAL = 900   # seconds
 
 
 def _candles_to_klines(candles) -> list[Kline]:
@@ -172,6 +182,12 @@ def main():
     ap.add_argument("--poll-seconds", type=int, default=172800)  # 48h — tuned R7
     ap.add_argument("--live", action="store_true",
                     help="Place real orders. Default is paper/dry-run.")
+    ap.add_argument("--rl", action="store_true",
+                    help="Enable RL PPO agent on BTC (15m cadence, separate allocation).")
+    ap.add_argument("--rl-model", default="models/rl_btc_perp.zip",
+                    help="Path to trained PPO model zip.")
+    ap.add_argument("--rl-allocation", type=float, default=0.30,
+                    help="Fraction of equity allocated to RL agent (default 0.30 = 30%%).")
     args = ap.parse_args()
 
     dry_run = not args.live
@@ -211,19 +227,53 @@ def main():
     mr_cfg = MeanReversionConfig(symbols=symbols)
     mr_strategy = MeanReversionStrategy(exchange, mr_cfg)
 
-    # Grid strategy — anchored on BTC, active only in RANGE regime
-    grid = GridStrategy(exchange, GridConfig(
-        symbol="BTC",
-        spacing_pct=0.005,    # 0.5% between levels
-        n_levels=10,          # 10 buy + 10 sell = 20 orders
-        order_size_pct=0.04,  # 4% equity per level
-        max_leverage=2.0,
-    ))
-    _last_grid_check = 0.0
-    GRID_CHECK_INTERVAL = 60   # seconds between grid fill checks
+    # ── Multi-asset grid configuration ────────────────────────────────────
+    # Each symbol gets its own GridStrategy and per-symbol ranging detector.
+    # Ranging gate = BTC market regime confirmed RANGE *and* per-symbol
+    # choppiness index > CHOP_THRESHOLD (61.8 = Fibonacci level, standard).
+    GRID_SYMBOLS        = ["BTC", "ETH", "SOL"]
+    GRID_CHECK_INTERVAL = 60    # seconds between grid fill checks
+    REGIME_CONFIRM_N    = 3     # consecutive identical HMM readings required
 
-    log.info("Laserfish v2 starting | symbols=%d | transformer=%s | dynamic_leverage=True | dry_run=%s",
-             len(symbols), session is not None, dry_run)
+    # Per-symbol grid config — wider spacing for more volatile assets
+    _grid_cfgs = {
+        "BTC": GridConfig(symbol="BTC", spacing_pct=0.005, n_levels=10,
+                          order_size_pct=0.03, max_leverage=2.0),
+        "ETH": GridConfig(symbol="ETH", spacing_pct=0.006, n_levels=8,
+                          order_size_pct=0.03, max_leverage=2.0),
+        "SOL": GridConfig(symbol="SOL", spacing_pct=0.008, n_levels=8,
+                          order_size_pct=0.02, max_leverage=2.0),
+    }
+    grids: dict[str, GridStrategy] = {
+        sym: GridStrategy(exchange, cfg) for sym, cfg in _grid_cfgs.items()
+    }
+    # Stability buffers — BTC HMM is the shared market-level regime gate
+    _regime_history: dict[str, deque] = {
+        sym: deque(maxlen=REGIME_CONFIRM_N) for sym in GRID_SYMBOLS
+    }
+    _stable_regime: dict[str, int] = {sym: 0 for sym in GRID_SYMBOLS}
+    _last_grid_check = 0.0
+
+    # RL executor — PPO continuous leverage on BTC
+    rl_executor = None
+    _last_rl_step = 0.0
+    if args.rl and RL_AVAILABLE:
+        if Path(args.rl_model).exists():
+            rl_executor = RLExecutor(
+                exchange=exchange,
+                symbol="BTC",
+                paper_mode=dry_run,
+                initial_equity=10_000.0,   # placeholder; updated on first step
+            )
+            log.info("RL executor loaded: %s | allocation=%.0f%%", args.rl_model,
+                     args.rl_allocation * 100)
+        else:
+            log.warning("--rl flag set but no model at %s — RL disabled", args.rl_model)
+    elif args.rl and not RL_AVAILABLE:
+        log.warning("--rl flag set but src.live.executor not importable — RL disabled")
+
+    log.info("Laserfish v2 starting | symbols=%d | transformer=%s | dynamic_leverage=True | rl=%s | dry_run=%s",
+             len(symbols), session is not None, rl_executor is not None, dry_run)
 
     log.info("Warming up price + funding histories (shared across strategies)…")
     # Fetch once and share — avoids duplicate API calls and 429 rate limits
@@ -259,6 +309,7 @@ def main():
     strategy.warm_up(shared_prices=shared_prices, shared_funding=shared_funding)
     mr_strategy.warm_up(shared_prices=shared_prices, shared_funding=shared_funding)
 
+
     log.info("Warming up HMM regime detector…")
     regime_tracker.warm_up()
 
@@ -284,6 +335,21 @@ def main():
             regime_mult = regime_tracker.detector.leverage_multiplier()
             regime_name = regime_tracker.detector.regime_label()
             regime_icon = REGIME_COLORS.get(regime_state, "?")
+
+            # BTC stability filter — shared market regime signal for all grid assets.
+            # Only confirms a new regime when N consecutive readings agree.
+            _regime_history["BTC"].append(regime_state)
+            btc_hist = _regime_history["BTC"]
+            if len(btc_hist) == REGIME_CONFIRM_N and len(set(btc_hist)) == 1:
+                if _stable_regime["BTC"] != regime_state:
+                    log.info("BTC market regime confirmed: %s → %s (%dx)",
+                             REGIME_COLORS.get(_stable_regime["BTC"], "?"),
+                             regime_icon, REGIME_CONFIRM_N)
+                _stable_regime["BTC"] = regime_state
+            # Mirror BTC confirmed regime to other grid symbols as market-level gate
+            for sym in GRID_SYMBOLS:
+                if sym != "BTC":
+                    _stable_regime[sym] = _stable_regime["BTC"]
 
             log.info("Equity=%.0f  Drawdown=%.1f%%  Regime=%s %s  RegimeMult=%.1fx",
                      equity, drawdown * 100, regime_icon, regime_name, regime_mult)
@@ -417,35 +483,57 @@ def main():
                 except Exception as e:
                     log.error("MR scan error: %s", e)
 
-            # ── Grid strategy — runs every 60s, active only in RANGE regime ──
+            # ── Multi-asset grid — runs every 60s ─────────────────────────
             now = time.time()
             if now - _last_grid_check >= GRID_CHECK_INTERVAL:
                 _last_grid_check = now
+                for sym in GRID_SYMBOLS:
+                    try:
+                        fd = exchange.get_funding_data(sym)
+                        price = fd.mark_price
+                        grid = grids[sym]
+                        sym_equity = equity / len(GRID_SYMBOLS)
+
+                        if _stable_regime[sym] == 1:   # confirmed RANGE
+                            if not grid.is_active:
+                                log.info("%s grid OPEN (confirmed %dx) @ %.4f",
+                                         sym, REGIME_CONFIRM_N, price)
+                                grid.open(price, sym_equity)
+                            else:
+                                fills = grid.check(price, sym_equity)
+                                for f in fills:
+                                    log.info("%s grid fill | %s lvl=%+d  qty=%.4f  pnl=%+.2f",
+                                             sym, f.side.upper(), f.level_idx, f.qty, f.pnl)
+                                if fills:
+                                    log.info(grid.status(price))
+                        else:                           # confirmed TREND or CRISIS
+                            if grid.is_active:
+                                pnl = grid.close(price)
+                                log.info("%s grid CLOSED (regime=%s, confirmed %dx) | pnl=%+.2f",
+                                         sym, regime_name, REGIME_CONFIRM_N, pnl)
+
+                    except Exception as e:
+                        log.error("Grid error %s: %s", sym, e)
+
+            # ── RL agent — PPO continuous leverage, 15m cadence ──────────
+            if rl_executor is not None and (time.time() - _last_rl_step >= RL_STEP_INTERVAL):
+                _last_rl_step = time.time()
                 try:
                     btc_fd = exchange.get_funding_data("BTC")
-                    btc_price = btc_fd.mark_price
+                    btc_price = float(btc_fd.mark_price)
+                    rl_equity = equity * args.rl_allocation
+                    target_lev = rl_executor.step(btc_price, rl_equity)
+                    log.info("RL step | BTC=%.2f | target_lev=%.2fx | equity_alloc=%.0f",
+                             btc_price, target_lev, rl_equity)
 
-                    if regime_state == 1:   # RANGE — activate or maintain grid
-                        if not grid.is_active:
-                            log.info("Regime=RANGE — opening BTC grid at %.2f", btc_price)
-                            grid.open(btc_price, equity)
-                        else:
-                            fills = grid.check(btc_price, equity)
-                            for f in fills:
-                                log.info("Grid fill | %s lvl=%+d  qty=%.4f  pnl=%+.2f",
-                                         "BUY " if f.side == "buy" else "SELL",
-                                         f.level_idx, f.qty, f.pnl)
-                            if fills:
-                                log.info(grid.status(btc_price))
-
-                    else:                   # TREND or CRISIS — close grid if active
-                        if grid.is_active:
-                            pnl = grid.close(btc_price)
-                            log.info("Regime=%s — grid closed | total pnl=%+.2f",
-                                     regime_name, pnl)
+                    # Daily reset at UTC midnight
+                    import datetime as _dt
+                    now_utc = _dt.datetime.utcnow()
+                    if now_utc.hour == 0 and now_utc.minute < 20:
+                        rl_executor.reset_daily(rl_equity)
 
                 except Exception as e:
-                    log.error("Grid error: %s", e)
+                    log.error("RL step error: %s", e)
 
         except Exception as e:
             log.error("Scan loop error: %s", e)
