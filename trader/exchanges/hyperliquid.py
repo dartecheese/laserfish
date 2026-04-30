@@ -269,42 +269,44 @@ class HyperliquidExchange(Exchange):
         hl_syms = [_hl_symbol(s) for s in targets]
         try:
             batch = self._client.fetch_funding_rates(hl_syms)
-        except Exception:
-            # Fallback: fetch one-by-one with backoff; never propagate 429s.
-            # Pre-load market metadata once so individual calls don't each
-            # trigger load_markets() → fetch_currencies() (extra API hit).
+        except Exception as _batch_exc:
+            # Batch failed — check if it was a rate limit before spending time
+            # on 25 individual calls.  If we're rate-limited, return [] immediately
+            # so the caller's 600s sleep acts as a back-off window.
             _logger = __import__("logging").getLogger(__name__)
-            for _attempt in range(3):
-                try:
-                    self._client.load_markets()
-                    break
-                except Exception as _e:
-                    if _attempt < 2:
-                        time.sleep(2 ** _attempt * 5)
-                    else:
-                        _logger.warning("Could not pre-load markets: %s", _e)
+            _is_rl = (
+                "429" in str(_batch_exc)
+                or isinstance(_batch_exc, ccxt.RateLimitExceeded)
+            )
+            if _is_rl:
+                _logger.warning(
+                    "Batch funding fetch rate-limited — returning empty results. "
+                    "Will retry after sleep interval."
+                )
+                return []
+
+            # Non-rate-limit batch failure: fall back to per-symbol with single
+            # attempt each.  Pre-load market metadata once to avoid per-symbol
+            # load_markets() → fetch_currencies() calls.
+            try:
+                self._client.load_markets()
+            except Exception as _e:
+                _logger.warning("Could not pre-load markets: %s", _e)
 
             results = []
             for i, s in enumerate(targets):
-                for attempt in range(4):
-                    try:
-                        results.append(self.get_funding_data(s))
-                        break
-                    except Exception as e:
-                        is_rate_limit = (
-                            "429" in str(e)
-                            or isinstance(e, ccxt.RateLimitExceeded)
+                try:
+                    results.append(self.get_funding_data(s))
+                except Exception as e:
+                    is_rate_limit = (
+                        "429" in str(e) or isinstance(e, ccxt.RateLimitExceeded)
+                    )
+                    if is_rate_limit:
+                        _logger.warning(
+                            "Rate limited on %s during fallback — aborting scan.", s
                         )
-                        if is_rate_limit and attempt < 3:
-                            wait = 2 ** attempt * 3   # 3, 6, 12, 24s
-                            time.sleep(wait)
-                        elif is_rate_limit:
-                            _logger.warning(
-                                "Rate limited on %s (all retries), skipping symbol.", s
-                            )
-                            break
-                        else:
-                            raise
+                        return results   # return what we have; caller sleeps 600s
+                    _logger.warning("Could not fetch %s: %s", s, e)
                 if i < len(targets) - 1:
                     time.sleep(0.30)  # 300ms between symbols ~3 req/s
             return results
@@ -387,15 +389,23 @@ class HyperliquidExchange(Exchange):
         return self._paper_portfolio.summary(prices)
 
     def _live_prices(self, symbols: list[str]) -> dict[str, float]:
-        """Fetch current mid-price for each symbol. Best-effort, empty on error."""
+        """Fetch current mid-price for each symbol. Falls back to last cached
+        price on 429 so paper-portfolio equity doesn't flicker between
+        marked-to-market and entry-price-fallback values."""
+        if not hasattr(self, "_price_cache"):
+            self._price_cache: dict[str, float] = {}
         prices: dict[str, float] = {}
         for sym in symbols:
             try:
                 candles = self.get_candles(sym, "1m", 1)
                 if candles:
                     prices[sym] = candles[-1].close
+                    self._price_cache[sym] = candles[-1].close
             except Exception:
-                pass
+                # Use last known price rather than letting paper portfolio
+                # fall back to entry_price (which causes equity to jump).
+                if sym in self._price_cache:
+                    prices[sym] = self._price_cache[sym]
         return prices
 
     # ------------------------------------------------------------------ #
