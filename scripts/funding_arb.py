@@ -45,6 +45,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("funding_arb")
+_arb_logger = logging.getLogger("trader.strategies.funding_arb")
 
 LOOP_INTERVAL = 600   # seconds between full scan cycles (10 min)
 WARMUP_LIMIT  = 90    # 8h periods to load on startup (~30 days)
@@ -69,10 +70,14 @@ def build_args() -> argparse.Namespace:
                    help="Disable spot hedge leg (directional mode, not recommended)")
     p.add_argument("--interval", type=int, default=LOOP_INTERVAL,
                    help="Loop interval in seconds")
+    p.add_argument("--verbose", action="store_true",
+                   help="Log per-symbol z-scores and filter reasons each scan")
     return p.parse_args()
 
 
 def print_banner(args: argparse.Namespace) -> None:
+    if args.verbose:
+        _arb_logger.setLevel(logging.DEBUG)
     mode = "PAPER" if args.paper else ("SCAN-ONLY" if args.scan_only else "LIVE")
     logger.info("=" * 60)
     logger.info("  Funding Rate Arbitrage Bot  [%s]", mode)
@@ -112,7 +117,7 @@ def run(args: argparse.Namespace) -> None:
         max_drawdown_pct=15.0,
     ))
 
-    logger.info("Warming up funding rate history…")
+    logger.info("Seeding funding rate history (cache + best-effort API)…")
     strategy.warm_up()
 
     if args.scan_only:

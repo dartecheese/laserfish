@@ -86,6 +86,8 @@ class HyperliquidExchange(Exchange):
             "privateKey": private_key,
             "walletAddress": wallet,
             "options": {"defaultType": "swap"},
+            "rateLimit": 200,        # 200ms between requests = 5 req/s
+            "enableRateLimit": True,
         })
 
         # Separate spot client — Hyperliquid requires defaultType="spot" for spot orders
@@ -93,6 +95,8 @@ class HyperliquidExchange(Exchange):
             "privateKey": private_key,
             "walletAddress": wallet,
             "options": {"defaultType": "spot"},
+            "rateLimit": 200,
+            "enableRateLimit": True,
         })
 
         self._paper_portfolio: PaperPortfolio | None = None
@@ -100,6 +104,16 @@ class HyperliquidExchange(Exchange):
         self._paper_spot: dict[str, float] = {}
         if paper and not wallet:
             self._paper_portfolio = PaperPortfolio(initial_equity=paper_equity)
+
+        # Pre-load market metadata once so subsequent calls skip load_markets().
+        # With backoff — if we're rate-limited at startup, wait before proceeding.
+        for _attempt in range(4):
+            try:
+                self._client.load_markets()
+                break
+            except Exception as _e:
+                if _attempt < 3:
+                    time.sleep(2 ** _attempt * 5)   # 5, 10, 20, 40s
 
     def get_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
         hl_sym = _hl_symbol(symbol)
@@ -256,8 +270,44 @@ class HyperliquidExchange(Exchange):
         try:
             batch = self._client.fetch_funding_rates(hl_syms)
         except Exception:
-            # Fallback: fetch one-by-one
-            return [self.get_funding_data(s) for s in targets]
+            # Fallback: fetch one-by-one with backoff; never propagate 429s.
+            # Pre-load market metadata once so individual calls don't each
+            # trigger load_markets() → fetch_currencies() (extra API hit).
+            _logger = __import__("logging").getLogger(__name__)
+            for _attempt in range(3):
+                try:
+                    self._client.load_markets()
+                    break
+                except Exception as _e:
+                    if _attempt < 2:
+                        time.sleep(2 ** _attempt * 5)
+                    else:
+                        _logger.warning("Could not pre-load markets: %s", _e)
+
+            results = []
+            for i, s in enumerate(targets):
+                for attempt in range(4):
+                    try:
+                        results.append(self.get_funding_data(s))
+                        break
+                    except Exception as e:
+                        is_rate_limit = (
+                            "429" in str(e)
+                            or isinstance(e, ccxt.RateLimitExceeded)
+                        )
+                        if is_rate_limit and attempt < 3:
+                            wait = 2 ** attempt * 3   # 3, 6, 12, 24s
+                            time.sleep(wait)
+                        elif is_rate_limit:
+                            _logger.warning(
+                                "Rate limited on %s (all retries), skipping symbol.", s
+                            )
+                            break
+                        else:
+                            raise
+                if i < len(targets) - 1:
+                    time.sleep(0.30)  # 300ms between symbols ~3 req/s
+            return results
 
         results: list[FundingData] = []
         for sym, hl_sym in zip(targets, hl_syms):

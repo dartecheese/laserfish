@@ -32,9 +32,12 @@ Signal construction:
 """
 from __future__ import annotations
 
+import json
 import logging
+import time as _time_module
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
@@ -43,6 +46,9 @@ from trader.exchanges.base import BracketParams, FundingData, Order
 from trader.exchanges.hyperliquid import SPOT_HEDGEABLE, HyperliquidExchange
 
 logger = logging.getLogger(__name__)
+
+_WARMUP_CACHE = Path(__file__).parent.parent.parent / "models" / "funding_warmup_cache.json"
+_CACHE_MAX_AGE_S = 8 * 3600  # cache valid for one 8h funding period
 
 
 @dataclass
@@ -148,18 +154,96 @@ class FundingArbStrategy:
     # Initialization                                                       #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # Warmup cache helpers                                                #
+    # ------------------------------------------------------------------ #
+
+    def _load_warmup_cache(self) -> dict[str, list[float]]:
+        """Return cached history if the cache file exists and is fresh (< 8h old)."""
+        if not _WARMUP_CACHE.exists():
+            return {}
+        age = _time_module.time() - _WARMUP_CACHE.stat().st_mtime
+        if age > _CACHE_MAX_AGE_S:
+            logger.info("Warmup cache is %.1fh old — will refresh.", age / 3600)
+            return {}
+        try:
+            data = json.loads(_WARMUP_CACHE.read_text())
+            logger.info("Loaded warmup cache (age %.1fh, %d symbols).", age / 3600, len(data))
+            return data
+        except Exception as exc:
+            logger.warning("Could not read warmup cache: %s", exc)
+            return {}
+
+    def _save_warmup_cache(self) -> None:
+        """Persist current history windows to disk."""
+        try:
+            _WARMUP_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            payload = {sym: list(dq) for sym, dq in self._history.items() if dq}
+            _WARMUP_CACHE.write_text(json.dumps(payload))
+            logger.debug("Warmup cache saved (%d symbols).", len(payload))
+        except Exception as exc:
+            logger.warning("Could not save warmup cache: %s", exc)
+
+    # ------------------------------------------------------------------ #
+
     def warm_up(self) -> None:
-        """Fetch funding rate history for all symbols to seed rolling windows."""
-        logger.info("Warming up funding rate history (%d symbols)…", len(self.cfg.symbols))
+        """Seed rolling history windows — from disk cache first, then best-effort API.
+
+        Warmup is non-blocking: if the API is rate-limited, symbols are skipped and
+        history accumulates naturally from scan() calls (need only 10 points for
+        z-score, ~100 minutes at the 10-min scan interval).
+        """
+        try:
+            import ccxt as _ccxt
+        except ImportError:
+            _ccxt = None
+
+        def _is_rate_limit(exc: Exception) -> bool:
+            return "429" in str(exc) or (
+                _ccxt is not None and isinstance(exc, _ccxt.RateLimitExceeded)
+            )
+
+        # ── 1. Try to load from disk cache (instant, no API calls) ────────
+        cached = self._load_warmup_cache()
+        cached_count = 0
         for sym in self.cfg.symbols:
+            if sym in cached and cached[sym]:
+                for rate in cached[sym]:
+                    self._history[sym].append(rate)
+                self._initialized.add(sym)
+                cached_count += 1
+
+        remaining = [s for s in self.cfg.symbols if s not in self._initialized]
+        logger.info(
+            "Warmup: %d symbols from cache, %d need API fetch (will skip on 429).",
+            cached_count, len(remaining),
+        )
+        if not remaining:
+            return
+
+        # ── 2. Best-effort API fetch — give each symbol ONE try with a
+        #       short wait, then skip. Don't hammer the API with retries.
+        #       History builds up from scan() calls if symbols are skipped.
+        skipped = 0
+        for i, sym in enumerate(remaining):
             try:
                 history = self.ex.get_funding_rate_history(sym, limit=self.cfg.history_window)
                 for _, rate in history:
                     self._history[sym].append(rate)
                 self._initialized.add(sym)
-                logger.debug("%s: loaded %d history points", sym, len(self._history[sym]))
             except Exception as exc:
+                if _is_rate_limit(exc):
+                    logger.info("Rate limited during warmup — skipping remaining %d symbols. "
+                                "History will accumulate from scans.", len(remaining) - i)
+                    skipped = len(remaining) - i
+                    break
                 logger.warning("Could not load history for %s: %s", sym, exc)
+            if i < len(remaining) - 1:
+                _time_module.sleep(2.0)  # 2s between symbols
+
+        # ── 3. Persist whatever we got so next restart is faster ──────────
+        if cached_count + len(remaining) - skipped > 0:
+            self._save_warmup_cache()
 
     # ------------------------------------------------------------------ #
     # Signal generation                                                    #
@@ -205,6 +289,7 @@ class FundingArbStrategy:
         """
         fd_list = self.ex.get_all_funding_data(self.cfg.symbols)
         signals: list[Signal] = []
+        verbose = logger.isEnabledFor(logging.DEBUG)
 
         for fd in fd_list:
             sym = fd.symbol
@@ -215,23 +300,36 @@ class FundingArbStrategy:
                 self._initialized.add(sym)
 
             # ── Filter 1: per-asset minimum funding magnitude ─────────────
-            if abs(fd.funding_rate_annualized) < self._asset_min_funding(sym):
+            min_fund = self._asset_min_funding(sym)
+            if abs(fd.funding_rate_annualized) < min_fund:
+                if verbose:
+                    logger.debug("  %-6s  fund_ann=%+.3f%%  <min %.3f%%  [F1:min_funding]",
+                                 sym, fd.funding_rate_annualized * 100, min_fund * 100)
                 self._consecutive_above[sym] = 0
                 continue
 
             # ── Filter 2: 20bps minimum basis (ScienceDirect 2024) ────────
             if abs(fd.basis_pct) < self.cfg.min_basis_pct:
+                if verbose:
+                    logger.debug("  %-6s  basis=%.4f%%  <min %.4f%%  [F2:min_basis]",
+                                 sym, fd.basis_pct * 100, self.cfg.min_basis_pct * 100)
                 self._consecutive_above[sym] = 0
                 continue
 
             # ── Filter 3: consecutive-readings gate ───────────────────────
             self._consecutive_above[sym] += 1
             if self._consecutive_above[sym] < self.cfg.require_consecutive:
+                if verbose:
+                    logger.debug("  %-6s  consec=%d/%d  [F3:consecutive]",
+                                 sym, self._consecutive_above[sym], self.cfg.require_consecutive)
                 continue
 
             # ── Filter 4: z-score entry threshold ────────────────────────
             z = self._z_score(sym, rate)
             if z is None or abs(z) < self.cfg.z_entry:
+                if verbose:
+                    logger.debug("  %-6s  z=%s  threshold=%.2f  [F4:z_entry]",
+                                 sym, f"{z:+.3f}" if z is not None else "None", self.cfg.z_entry)
                 continue
 
             # ── Conviction: momentum amplifier (He et al.) ────────────────
@@ -266,6 +364,11 @@ class FundingArbStrategy:
             ))
 
         signals.sort(key=lambda s: s.alpha, reverse=True)
+
+        # Refresh disk cache every scan so restarts are instant.
+        if len(fd_list) >= len(self.cfg.symbols) // 2:
+            self._save_warmup_cache()
+
         return signals
 
     # ------------------------------------------------------------------ #

@@ -237,12 +237,12 @@ def main():
 
     # Per-symbol grid config — wider spacing for more volatile assets
     _grid_cfgs = {
-        "BTC": GridConfig(symbol="BTC", spacing_pct=0.005, n_levels=10,
+        "BTC": GridConfig(symbol="BTC", spacing_pct=0.003, n_levels=10,
+                          order_size_pct=0.05, max_leverage=2.0),
+        "ETH": GridConfig(symbol="ETH", spacing_pct=0.005, n_levels=8,
+                          order_size_pct=0.05, max_leverage=2.0),
+        "SOL": GridConfig(symbol="SOL", spacing_pct=0.006, n_levels=8,
                           order_size_pct=0.03, max_leverage=2.0),
-        "ETH": GridConfig(symbol="ETH", spacing_pct=0.006, n_levels=8,
-                          order_size_pct=0.03, max_leverage=2.0),
-        "SOL": GridConfig(symbol="SOL", spacing_pct=0.008, n_levels=8,
-                          order_size_pct=0.02, max_leverage=2.0),
     }
     grids: dict[str, GridStrategy] = {
         sym: GridStrategy(exchange, cfg) for sym, cfg in _grid_cfgs.items()
