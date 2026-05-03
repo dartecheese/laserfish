@@ -1,8 +1,17 @@
 """In-memory paper trading portfolio.
 
-Tracks simulated positions, margin, unrealized PnL, and funding payments
-so that paper-mode scripts behave identically to live trading — positions
-persist between ticks, equity updates with mark price, funding accrues.
+Tracks simulated positions, margin, unrealized PnL, funding payments,
+trading fees, and slippage so paper-mode results approximate live behavior.
+
+Cost model (defaults match Hyperliquid 2026):
+  - Taker fee: 0.045% (4.5 bps) per fill — applied on both open and close.
+  - Slippage: per-symbol bps loss vs mark price on entry and exit.
+    Majors  (BTC/ETH/SOL) ........ 3 bps
+    Mid-cap (BNB/AVAX/LINK/DOGE/XRP) 7 bps
+    Alts    (everything else) ...... 15 bps
+  - Funding: applied via apply_funding(); shorts receive when rate>0.
+
+To disable any cost, set fee_bps / slippage_bps to 0 at construction.
 """
 from __future__ import annotations
 
@@ -10,6 +19,16 @@ import time
 from dataclasses import dataclass, field
 
 from trader.exchanges.base import Balance, Order, Position
+
+
+# Per-symbol slippage in basis points (1 bp = 0.01%).
+# Reflects approx Hyperliquid 1m-window mid-to-fill cost for $5–10K orders.
+_DEFAULT_SLIPPAGE_BPS: dict[str, float] = {
+    "BTC": 3, "ETH": 3, "SOL": 3,
+    "BNB": 7, "AVAX": 7, "LINK": 7, "DOGE": 7, "XRP": 7,
+    "ARB": 7, "OP": 7, "MATIC": 7, "LTC": 7, "ADA": 7, "DOT": 7,
+}
+_FALLBACK_SLIPPAGE_BPS = 15.0   # alts / illiquid
 
 
 @dataclass
@@ -20,6 +39,7 @@ class _PaperPos:
     entry_price: float
     leverage: int
     funding_pnl: float = 0.0
+    fees_paid: float = 0.0   # cumulative taker fee paid on this position
 
     @property
     def signed_qty(self) -> float:
@@ -41,20 +61,49 @@ class _PaperPos:
 
 class PaperPortfolio:
     """
-    Simulates a perpetuals trading account with no real exchange calls.
+    Simulates a perpetuals trading account with realistic costs.
 
-    Used by HyperliquidExchange in paper mode to give strategies realistic
-    feedback: positions persist, equity changes, funding accrues every tick.
+    Default cost model approximates live Hyperliquid execution:
+      taker fee 4.5 bps + per-symbol slippage (3-15 bps).
+    Set fee_bps=0 / slippage_bps_override=0 to disable.
     """
 
-    def __init__(self, initial_equity: float = 10_000.0) -> None:
+    def __init__(
+        self,
+        initial_equity: float = 10_000.0,
+        fee_bps: float = 4.5,
+        slippage_bps: dict[str, float] | None = None,
+        slippage_default_bps: float = _FALLBACK_SLIPPAGE_BPS,
+    ) -> None:
         self.initial_equity = initial_equity
         self._cash = initial_equity
         self._margin: dict[str, float] = {}
         self._positions: dict[str, _PaperPos] = {}
         self._realized_pnl = 0.0
         self._funding_total = 0.0
+        self._fees_total = 0.0
+        self._slippage_total = 0.0
         self._trades: list[dict] = []
+
+        self._fee_rate = fee_bps / 10_000.0
+        self._slip_table = dict(_DEFAULT_SLIPPAGE_BPS)
+        if slippage_bps:
+            self._slip_table.update(slippage_bps)
+        self._slip_default = slippage_default_bps
+
+    # ------------------------------------------------------------------ #
+    # Cost helpers                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _slip_rate(self, symbol: str) -> float:
+        return self._slip_table.get(symbol, self._slip_default) / 10_000.0
+
+    def _fill_price(self, symbol: str, side: str, mid_price: float) -> float:
+        """Mid price adjusted for slippage in adverse direction."""
+        slip = self._slip_rate(symbol)
+        if side == "buy" or side == "long":
+            return mid_price * (1.0 + slip)
+        return mid_price * (1.0 - slip)
 
     # ------------------------------------------------------------------ #
     # Order execution                                                      #
@@ -68,13 +117,24 @@ class PaperPortfolio:
         price: float,
         leverage: int = 1,
     ) -> Order:
-        notional = qty * price
-        margin   = notional / max(leverage, 1)
+        # Normalize side: strategies pass "buy"/"sell" or "long"/"short"
+        long_side = side in ("buy", "long")
+        position_side = "long" if long_side else "short"
 
-        # Scale down if not enough free cash
-        if margin > self._cash:
-            qty    = self._cash * leverage / price
-            margin = self._cash
+        fill_price = self._fill_price(symbol, side, price)
+        notional   = qty * fill_price
+        fee        = notional * self._fee_rate
+        slip_cost  = qty * abs(fill_price - price)
+        margin     = notional / max(leverage, 1)
+
+        # Scale down if margin + fee exceed free cash
+        max_outlay = self._cash - fee
+        if margin > max_outlay and max_outlay > 0:
+            qty       = max_outlay * leverage / fill_price
+            notional  = qty * fill_price
+            fee       = notional * self._fee_rate
+            slip_cost = qty * abs(fill_price - price)
+            margin    = notional / max(leverage, 1)
 
         if qty <= 0:
             return Order(f"paper-skip-{int(time.time()*1000)}", symbol, side, 0.0, price, "cancelled")
@@ -82,20 +142,24 @@ class PaperPortfolio:
         if symbol in self._positions:
             self.close(symbol, price)
 
-        self._cash           -= margin
+        self._cash           -= margin + fee
+        self._fees_total     += fee
+        self._slippage_total += slip_cost
         self._margin[symbol]  = margin
         self._positions[symbol] = _PaperPos(
-            symbol=symbol, side=side, qty=qty,
-            entry_price=price, leverage=leverage,
+            symbol=symbol, side=position_side, qty=qty,
+            entry_price=fill_price, leverage=leverage,
+            fees_paid=fee,
         )
         self._trades.append({
-            "action": "open", "symbol": symbol, "side": side,
-            "qty": qty, "price": price, "ts": time.time(),
+            "action": "open", "symbol": symbol, "side": position_side,
+            "qty": qty, "price": fill_price, "fee": fee,
+            "slippage": slip_cost, "ts": time.time(),
         })
         return Order(
             order_id=f"paper-{int(time.time()*1000)}",
             symbol=symbol, side=side, quantity=qty,
-            price=price, status="filled",
+            price=fill_price, status="filled",
         )
 
     def close(self, symbol: str, current_price: float) -> float:
@@ -103,12 +167,25 @@ class PaperPortfolio:
         margin = self._margin.pop(symbol, 0.0)
         if pos is None:
             return 0.0
-        pnl = pos.unrealized_pnl(current_price) + pos.funding_pnl
-        self._cash          += margin + pnl
-        self._realized_pnl  += pnl
+
+        # Exit slippage: pay spread on the opposite side of entry
+        exit_side = "sell" if pos.side == "long" else "buy"
+        fill_price = self._fill_price(symbol, exit_side, current_price)
+        slip_cost  = pos.qty * abs(fill_price - current_price)
+        notional   = pos.qty * fill_price
+        fee        = notional * self._fee_rate
+
+        gross_pnl = pos.signed_qty * (fill_price - pos.entry_price)
+        pnl       = gross_pnl + pos.funding_pnl - fee
+
+        self._cash           += margin + pnl
+        self._realized_pnl   += pnl
+        self._fees_total     += fee
+        self._slippage_total += slip_cost
         self._trades.append({
             "action": "close", "symbol": symbol,
-            "pnl": pnl, "price": current_price, "ts": time.time(),
+            "pnl": pnl, "fee": fee, "slippage": slip_cost,
+            "price": fill_price, "ts": time.time(),
         })
         return pnl
 
@@ -160,6 +237,7 @@ class PaperPortfolio:
         lines = [
             f"  Equity   ${equity:>10,.2f}   ({ret_pct:+.2f}%)",
             f"  Realized ${self._realized_pnl:>+10,.2f}   Funding ${self._funding_total:>+,.2f}",
+            f"  Fees     ${self._fees_total:>10,.2f}   Slippage ${self._slippage_total:>+,.2f}",
         ]
         for sym, pos in self._positions.items():
             price = prices.get(sym, pos.entry_price)
