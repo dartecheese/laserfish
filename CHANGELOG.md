@@ -7,6 +7,54 @@ the paper portfolio does and does not simulate.
 
 ---
 
+## v2.6 — CRITICAL: fix paper-mode phantom-PnL bug (2026-05-04)
+
+**Tag:** `v2.6-close-price-fix`
+
+`HyperliquidExchange.close_position()` was passing `prices.get(symbol, 0.0)` to
+the paper portfolio when `_live_prices()` failed (e.g., 429 rate limit).
+The portfolio then computed `gross_pnl = signed_qty * (0 - entry_price)` —
+booking a fake "profit" equal to the full short notional, or a fake "loss"
+equal to the full long notional.
+
+### Confirmed forensic evidence
+
+On 2026-05-02 17:52:05 the bot logged `BNB: momentum reversed → closing sell`
+on a 7.5817 BNB short opened at 618.22.  Equity jumped from $12,016 to $16,686
+on the next reading — exactly +$4,670, which equals `7.5817 * 618.22` (the
+short notional valued against a $0 close).  Independent MTM at the time of
+audit showed the open positions were actually worth **-$347**, not the
++$6,719 the paper portfolio reported.
+
+### Audit conclusion for prior runs
+
+The "+33.6% over 3 days" headline from v2.4 was not real.  31 close events
+fired across the run (Apr 25 – May 4), each with the same vulnerability.
+Any one of them that hit a 429 during close would have booked a phantom gain
+or loss.  All paper P&L numbers from v2.0 onward should be considered
+suspect until re-run on v2.6.
+
+### Fix
+
+Fall back to the position's `entry_price` when no live price is available,
+so the close is a no-op rather than a fake fill.  Log a warning so future
+operators can spot this in real time.
+
+```python
+close_price = prices.get(symbol)
+if not close_price or close_price <= 0:
+    pos = self._paper_portfolio._positions.get(symbol)
+    if pos is None:
+        return
+    close_price = pos.entry_price
+    logger.warning("close_position(%s): no live price — using entry %.4f", ...)
+self._paper_portfolio.close(symbol, close_price)
+```
+
+This was a pre-existing bug, not something introduced by v2.5.
+
+---
+
 ## v2.5 — Realistic paper costs (2026-05-03)
 
 **Tag:** `v2.5-realistic-costs` · **Commit:** `5da1792`

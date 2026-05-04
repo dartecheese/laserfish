@@ -223,7 +223,20 @@ class HyperliquidExchange(Exchange):
     def close_position(self, symbol: str) -> None:
         if self._paper_portfolio is not None:
             prices = self._live_prices([symbol])
-            self._paper_portfolio.close(symbol, prices.get(symbol, 0.0))
+            close_price = prices.get(symbol)
+            if not close_price or close_price <= 0:
+                # Fall back to the open position's entry price rather than $0,
+                # which would book a fake gain equal to the entire short notional.
+                pos = self._paper_portfolio._positions.get(symbol)
+                if pos is None:
+                    return  # nothing to close
+                close_price = pos.entry_price
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    "close_position(%s): no live price — using entry %.4f as close",
+                    symbol, close_price,
+                )
+            self._paper_portfolio.close(symbol, close_price)
             return
         positions = self.get_positions()
         for p in positions:
